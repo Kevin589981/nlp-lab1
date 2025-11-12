@@ -8,7 +8,7 @@
 # 保存到/kaggle/working/data/samsum目录
 
 # %%
-# !pip install rouge-score  # Run this in Kaggle notebook before executing the script
+# !pip install rouge-score accelerate
 
 # %%
 
@@ -97,6 +97,14 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# 导入accelerate用于多GPU训练
+try:
+    from accelerate import Accelerator
+    ACCELERATE_AVAILABLE = True
+except ImportError:
+    ACCELERATE_AVAILABLE = False
+    print("警告: accelerate库未安装，将使用单GPU训练")
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -560,8 +568,6 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 from torch.utils.data import Dataset, DataLoader
 import tiktoken
 
@@ -598,7 +604,7 @@ class Config:
     
     # 批次配置
     batch_size = 16              # 每个GPU的批次大小（micro-batch size）
-    gradient_accumulation_steps = 8  # 梯度累积步数，有效批次 = batch_size * gradient_accumulation_steps * num_gpus
+    gradient_accumulation_steps = 16  # 梯度累积步数，有效批次 = batch_size * gradient_accumulation_steps * num_gpus
     block_size = 1024           # 上下文窗口大小（最大序列长度）
     
     # 训练步数
@@ -653,13 +659,12 @@ class Config:
     device = 'cuda' if torch.cuda.is_available() else 'cpu'  # 训练设备
     dtype = 'float16'#'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
     # dtype = 'float32'
-    compile = True#False             # 是否使用PyTorch 2.0编译（需要CUDA Capability >= 7.0，P100不支持）
-    backend = 'nccl'            # DDP后端（'nccl'用于GPU，'gloo'用于CPU）
+    compile = False  # accelerate暂不支持torch.compile
     
     # =========================================================================
-    # DDP配置（多GPU训练）
+    # 多GPU配置（使用accelerate）
     # =========================================================================
-    ddp = True                  # 是否使用DDP（多GPU训练）
+    use_accelerate = True       # 是否使用accelerate进行多GPU训练（自动检测）
     
     # =========================================================================
     # 测试/生成配置
@@ -1160,51 +1165,57 @@ def get_lr(iter_num):
 
 def train():
     """训练主函数"""
-    # DDP设置
-    ddp = config.ddp and torch.cuda.device_count() > 1
-    if ddp:
-        init_process_group(backend=config.backend)
-        ddp_rank = int(os.environ['RANK'])
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        ddp_world_size = int(os.environ['WORLD_SIZE'])
-        device = f'cuda:{ddp_local_rank}'
-        torch.cuda.set_device(device)
-        master_process = ddp_rank == 0
-        seed_offset = ddp_rank
-        assert config.gradient_accumulation_steps % ddp_world_size == 0
-        config.gradient_accumulation_steps //= ddp_world_size
-    else:
-        master_process = True
-        seed_offset = 0
-        ddp_world_size = 1
-        device = config.device
+    # 初始化accelerator
+    use_accelerate = config.use_accelerate and ACCELERATE_AVAILABLE and torch.cuda.device_count() > 1
     
-    if master_process:
+    if use_accelerate:
+        # 使用accelerate进行多GPU训练
+        accelerator = Accelerator(
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            mixed_precision='fp16' if config.dtype == 'float16' else 'no'
+        )
+        device = accelerator.device
+        is_main_process = accelerator.is_main_process
+        
+        if is_main_process:
+            print("\n" + "=" * 80)
+            print("开始训练...")
+            print("=" * 80)
+            print(f"使用Accelerate多GPU训练: {accelerator.num_processes} GPUs")
+            print(f"混合精度: {accelerator.mixed_precision}")
+    else:
+        # 单GPU训练
+        accelerator = None
+        device = config.device
+        is_main_process = True
+        
         print("\n" + "=" * 80)
         print("开始训练...")
         print("=" * 80)
-        if ddp:
-            print(f"DDP训练: {ddp_world_size} GPUs")
+        print("单GPU训练")
     
     # 设置随机种子
-    torch.manual_seed(1337 + seed_offset)
+    torch.manual_seed(1337)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     
     # 创建输出目录
-    if master_process:
+    if is_main_process:
         os.makedirs(config.out_dir, exist_ok=True)
     
-    # 设置设备和精度
-    device_type = 'cuda' if 'cuda' in device else 'cpu'
-    ptdtype = {
-        'float32': torch.float32,
-        'bfloat16': torch.bfloat16,
-        'float16': torch.float16
-    }[config.dtype]
-    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(
-        device_type=device_type, dtype=ptdtype
-    )
+    # 设置精度上下文（accelerate会自动处理混合精度）
+    if use_accelerate:
+        ctx = nullcontext()  # accelerate自动处理
+    else:
+        device_type = 'cuda' if 'cuda' in config.device else 'cpu'
+        ptdtype = {
+            'float32': torch.float32,
+            'bfloat16': torch.bfloat16,
+            'float16': torch.float16
+        }[config.dtype]
+        ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(
+            device_type=device_type, dtype=ptdtype
+        )
     
     # 数据目录
     data_dir = os.path.join('data', config.dataset)
@@ -1216,11 +1227,11 @@ def train():
         with open(meta_path, 'rb') as f:
             meta = pickle.load(f)
         meta_vocab_size = meta['vocab_size']
-        if master_process:
+        if is_main_process:
             print(f"从 {meta_path} 加载词表大小: {meta_vocab_size}")
     
     # 初始化模型
-    if master_process:
+    if is_main_process:
         print(f"\n模型初始化方式: {config.init_from}")
     model_args = dict(
         n_layer=config.n_layer,
@@ -1234,7 +1245,7 @@ def train():
     
     if config.init_from == 'scratch':
         # 从头训练
-        if master_process:
+        if is_main_process:
             print("从头开始训练新模型")
         model_args['vocab_size'] = meta_vocab_size if meta_vocab_size else 50304
         gptconf = GPTConfig(**model_args)
@@ -1244,10 +1255,10 @@ def train():
         
     elif config.init_from == 'resume':
         # 从checkpoint恢复
-        if master_process:
+        if is_main_process:
             print(f"从 {config.out_dir} 恢复训练")
         ckpt_path = os.path.join(config.out_dir, 'ckpt.pt')
-        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint = torch.load(ckpt_path, map_location='cpu')
         checkpoint_model_args = checkpoint['model_args']
         
         for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
@@ -1268,7 +1279,7 @@ def train():
         
     elif config.init_from.startswith('gpt2'):
         # 从预训练GPT-2加载
-        if master_process:
+        if is_main_process:
             print(f"从OpenAI GPT-2加载: {config.init_from}")
         override_args = dict(dropout=config.dropout)
         model = GPT.from_pretrained(config.init_from, override_args)
@@ -1284,9 +1295,11 @@ def train():
         model.crop_block_size(config.block_size)
         model_args['block_size'] = config.block_size
     
-    model.to(device)
+    if not use_accelerate:
+        model.to(device)
     
     # 初始化优化器
+    device_type = 'cuda' if 'cuda' in str(device) else 'cpu'
     optimizer = model.configure_optimizers(
         config.weight_decay,
         config.learning_rate,
@@ -1299,33 +1312,46 @@ def train():
     
     checkpoint = None  # 释放内存
     
-    # 编译模型（可选，PyTorch 2.0+）
-    if config.compile:
-        if master_process:
+    # 使用accelerate准备模型、优化器和数据
+    if use_accelerate:
+        model, optimizer = accelerator.prepare(model, optimizer)
+        if is_main_process:
+            print(f"模型已通过Accelerate准备，分布在 {accelerator.num_processes} 个GPU上")
+    
+    # 编译模型（accelerate暂不支持）
+    if config.compile and not use_accelerate:
+        if is_main_process:
             print("编译模型（首次会比较慢）...")
         unoptimized_model = model
         model = torch.compile(model)
     
-    # 包装为DDP
-    if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
-    
-    # 初始化GradScaler（用于混合精度训练）
-    scaler = torch.cuda.amp.GradScaler(enabled=(config.dtype == 'float16'))
+    # 初始化GradScaler（accelerate会自动处理）
+    if use_accelerate:
+        scaler = None  # accelerate自动处理
+    else:
+        scaler = torch.cuda.amp.GradScaler(enabled=(config.dtype == 'float16'))
     
     # 训练循环
-    if master_process:
+    num_processes = accelerator.num_processes if use_accelerate else 1
+    if is_main_process:
         print("\n开始训练循环...")
         print(f"总迭代次数: {config.max_iters}")
         print(f"批次大小: {config.batch_size}")
         print(f"梯度累积步数: {config.gradient_accumulation_steps}")
-        print(f"有效批次大小: {config.batch_size * config.gradient_accumulation_steps * ddp_world_size}")
+        print(f"GPU数量: {num_processes}")
+        print(f"有效批次大小: {config.batch_size * config.gradient_accumulation_steps * num_processes}")
         print("-" * 80)
     
     X, Y = get_batch('train', data_dir)
     t0 = time.time()
     local_iter_num = 0
-    raw_model = model.module if ddp else model
+    
+    # 获取原始模型（用于保存和评估）
+    if use_accelerate:
+        raw_model = accelerator.unwrap_model(model)
+    else:
+        raw_model = model
+    
     running_mfu = -1.0
     
     while True:
@@ -1335,74 +1361,103 @@ def train():
             param_group['lr'] = lr
         
         # 评估和保存checkpoint
-        if iter_num % config.eval_interval == 0 and master_process:
-            losses = estimate_loss(raw_model, ctx, data_dir)
-            print(f"\nStep {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if iter_num % config.eval_interval == 0:
+            if use_accelerate:
+                accelerator.wait_for_everyone()
             
-            # 计算ROUGE分数（从第一次评估后开始，避免初始化时模型输出不稳定）
-            if iter_num > 0 and config.eval_rouge_during_training:
-                print("  评估ROUGE分数...")
-                rouge_scores = evaluate_rouge_during_training(
-                    raw_model, ctx, data_dir, num_samples=config.rouge_eval_samples
-                )
-                if rouge_scores:
-                    print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}, "
-                          f"ROUGE-2: {rouge_scores['rouge2']:.4f}, "
-                          f"ROUGE-L: {rouge_scores['rougeL']:.4f}")
+            if is_main_process:
+                losses = estimate_loss(raw_model, ctx, data_dir)
+                print(f"\nStep {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+                
+                # 计算ROUGE分数（从第一次评估后开始，避免初始化时模型输出不稳定）
+                if iter_num > 0 and config.eval_rouge_during_training:
+                    print("  评估ROUGE分数...")
+                    rouge_scores = evaluate_rouge_during_training(
+                        raw_model, ctx, data_dir, num_samples=config.rouge_eval_samples
+                    )
+                    if rouge_scores:
+                        print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}, "
+                              f"ROUGE-2: {rouge_scores['rouge2']:.4f}, "
+                              f"ROUGE-L: {rouge_scores['rougeL']:.4f}")
+                
+                # 保存checkpoint
+                if losses['val'] < best_val_loss or config.always_save_checkpoint:
+                    best_val_loss = losses['val']
+                    if iter_num > 0:
+                        checkpoint = {
+                            'model': raw_model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'model_args': model_args,
+                            'iter_num': iter_num,
+                            'best_val_loss': best_val_loss,
+                            'config': vars(config),
+                        }
+                        print(f"  保存checkpoint到 {config.out_dir}")
+                        torch.save(checkpoint, os.path.join(config.out_dir, 'ckpt.pt'))
             
-            # 保存checkpoint
-            if losses['val'] < best_val_loss or config.always_save_checkpoint:
-                best_val_loss = losses['val']
-                if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': vars(config),
-                    }
-                    print(f"  保存checkpoint到 {config.out_dir}")
-                    torch.save(checkpoint, os.path.join(config.out_dir, 'ckpt.pt'))
-        
-        if iter_num % config.eval_interval == 0 and ddp:
-            torch.distributed.barrier()
+            if use_accelerate:
+                accelerator.wait_for_everyone()
         
         if iter_num == 0 and config.eval_only:
             break
         
         # 前向-反向传播（带梯度累积）
-        for micro_step in range(config.gradient_accumulation_steps):
-            with ctx:
-                logits, loss = model(X, Y)
-                loss = loss / config.gradient_accumulation_steps
+        if use_accelerate:
+            # 使用accelerate的梯度累积
+            with accelerator.accumulate(model):
+                with ctx:
+                    logits, loss = model(X, Y)
+                
+                # 反向传播
+                accelerator.backward(loss)
+                
+                # 梯度裁剪
+                if config.grad_clip != 0.0:
+                    accelerator.clip_grad_norm_(model.parameters(), config.grad_clip)
+                
+                # 更新参数
+                optimizer.step()
+                optimizer.zero_grad()
             
-            # 异步预取下一个batch
+            # 预取下一个batch
             X, Y = get_batch('train', data_dir)
+        else:
+            # 原始的梯度累积逻辑
+            for micro_step in range(config.gradient_accumulation_steps):
+                with ctx:
+                    logits, loss = model(X, Y)
+                    loss = loss / config.gradient_accumulation_steps
+                
+                # 异步预取下一个batch
+                X, Y = get_batch('train', data_dir)
+                
+                # 反向传播
+                scaler.scale(loss).backward()
             
-            # 反向传播
-            scaler.scale(loss).backward()
-        
-        # 梯度裁剪
-        if config.grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        
-        # 更新参数
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+            # 梯度裁剪
+            if config.grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+            
+            # 更新参数
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
         
         # 记录日志
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
         
-        if iter_num % config.log_interval == 0 and master_process:
-            lossf = loss.item() * config.gradient_accumulation_steps
+        if iter_num % config.log_interval == 0 and is_main_process:
+            if use_accelerate:
+                lossf = loss.item()
+            else:
+                lossf = loss.item() * config.gradient_accumulation_steps
+            
             if local_iter_num >= 5:
                 mfu = raw_model.estimate_mfu(
-                    config.batch_size * config.gradient_accumulation_steps * ddp_world_size, dt
+                    config.batch_size * config.gradient_accumulation_steps * num_processes, dt
                 )
                 running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
@@ -1414,10 +1469,7 @@ def train():
         if iter_num > config.max_iters:
             break
     
-    if ddp:
-        destroy_process_group()
-    
-    if master_process:
+    if is_main_process:
         print("\n训练完成！")
         print("=" * 80)
 
@@ -1627,50 +1679,38 @@ def main():
     2. 训练模型
     3. 评估模型
     """
-    # 检查是否在DDP环境中
-    is_ddp = 'RANK' in os.environ
-    master_process = not is_ddp or int(os.environ.get('RANK', 0)) == 0
-    
-    if master_process:
-        print("\n")
-        print("=" * 80)
-        print("GPT-2 摘要微调教学脚本".center(80))
-        print("=" * 80)
-        print("\n当前配置:")
-        print(f"  数据集: {config.dataset_path}")
-        print(f"  模型初始化: {config.init_from}")
-        print(f"  设备: {config.device}")
-        print(f"  批次大小: {config.batch_size}")
-        print(f"  最大迭代次数: {config.max_iters}")
-        print(f"  学习率: {config.learning_rate}")
-        if config.ddp and torch.cuda.device_count() > 1:
-            print(f"  多GPU训练: {torch.cuda.device_count()} GPUs")
+    print("\n")
+    print("=" * 80)
+    print("GPT-2 摘要微调教学脚本".center(80))
+    print("=" * 80)
+    print("\n当前配置:")
+    print(f"  数据集: {config.dataset_path}")
+    print(f"  模型初始化: {config.init_from}")
+    print(f"  设备: {config.device}")
+    print(f"  批次大小: {config.batch_size}")
+    print(f"  最大迭代次数: {config.max_iters}")
+    print(f"  学习率: {config.learning_rate}")
+    if config.use_accelerate and torch.cuda.device_count() > 1:
+        print(f"  多GPU训练: {torch.cuda.device_count()} GPUs (使用Accelerate)")
     
     # 步骤1: 准备数据
     data_dir = os.path.join('data', config.dataset)
     train_pkl = os.path.join(data_dir, 'train.pkl')
     
-    if master_process:
-        print("expect: train_pkl:",train_pkl)
+    print("expect: train_pkl:",train_pkl)
     
     if not os.path.exists(train_pkl):
-        if master_process:
-            print("\n未找到处理后的数据文件，开始准备数据...")
-            prepare_data()
-        # 等待主进程完成数据准备
-        if is_ddp:
-            torch.distributed.barrier()
+        print("\n未找到处理后的数据文件，开始准备数据...")
+        prepare_data()
     else:
-        if master_process:
-            print("\n找到已处理的数据文件，跳过数据准备步骤")
-            print(f"如需重新准备数据，请删除 {data_dir} 目录")
+        print("\n找到已处理的数据文件，跳过数据准备步骤")
+        print(f"如需重新准备数据，请删除 {data_dir} 目录")
     
     # 步骤2: 训练模型
     if not config.eval_only:
         train()
     else:
-        if master_process:
-            print("\neval_only=True，跳过训练")
+        print("\neval_only=True，跳过训练")
     
     
 
@@ -1918,10 +1958,10 @@ def predict_test_set_fast():
 # ## 测试evaluate
 
 # %%
-!pip install rouge-score
-evaluate()
+# !pip install rouge-score
+# evaluate()
 
 # %%
-predict_test_set_fast()
+# predict_test_set_fast()
 
 
