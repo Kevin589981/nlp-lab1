@@ -88,7 +88,8 @@ class Config:
     
     # 模型配置
     model_name = 'facebook/bart-base'
-    
+    label_smoothing_factor = 0.1
+
     # 训练配置
     init_from = 'pretrained'  # 'pretrained', 'resume', 'scratch'
     resume_from = None  # checkpoint路径，当init_from='resume'时使用
@@ -97,13 +98,13 @@ class Config:
     use_multi_gpu = True  # 是否使用多GPU
     
     # 批次配置 - 针对2个T4 GPU优化
-    batch_size = 16  # 每个GPU的batch size
-    gradient_accumulation_steps = 4  # 减少梯度累积，因为有2个GPU
+    batch_size = 64  # 每个GPU的batch size
+    gradient_accumulation_steps = 8  # 减少梯度累积，因为有2个GPU
     max_source_length = 512  # 输入对话的最大长度
     max_target_length = 128  # 目标摘要的最大长度
     
     # 训练步数
-    max_iters = 500
+    max_iters = 10
     
     # 优化器配置
     learning_rate = 3e-5
@@ -113,8 +114,9 @@ class Config:
     grad_clip = 1.0
     
     # 学习率调度
-    decay_lr = False
-    warmup_iters = 100
+    decay_lr = True
+    # warmup_iters = 100
+    warmup_iters = int(0.1 *max_iters)
     lr_decay_iters = 500
     min_lr = 1e-6
     
@@ -142,7 +144,7 @@ class Config:
     
     # 生成配置
     num_test_samples = 10
-    num_beams = 4
+    num_beams = 8 # 束搜索宽度
     temperature = 1.0
     top_k = 50
     top_p = 0.95
@@ -452,7 +454,11 @@ def train():
             ckpt_path = config.resume_from
         
         checkpoint = torch.load(ckpt_path, map_location=config.device)
-        model = BartForConditionalGeneration.from_pretrained(config.model_name)
+        model = BartForConditionalGeneration.from_pretrained(
+            config.model_name,
+            label_smoothing_factor=config.label_smoothing_factor  # <--- 传入参数
+        )
+        print(f"  启用标签平滑, factor: {config.label_smoothing_factor}") 
         
         # 处理DataParallel保存的模型
         state_dict = checkpoint['model']
