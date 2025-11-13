@@ -291,6 +291,9 @@ def estimate_loss(model, ctx, tokenizer):
             with ctx:
                 outputs = model(**batch)
                 loss = outputs.loss
+                if torch.cuda.device_count() > 1 and config.use_multi_gpu:
+                # 当使用DataParallel时，loss是一个向量，需要求平均值
+                    loss = loss.mean()
             losses[k] = loss.item()
         out[split] = losses.mean()
     
@@ -568,9 +571,15 @@ def train():
             with ctx:
                 outputs = model(**batch)
                 loss = outputs.loss
-                # DataParallel会自动平均多GPU的loss
+                # 当使用DataParallel时，loss是一个包含每个GPU loss的向量
+                # 我们需要先求平均值，得到整个批次的平均loss
+                if torch.cuda.device_count() > 1 and config.use_multi_gpu:
+                    loss = loss.mean()
+                
                 loss = loss / config.gradient_accumulation_steps
             
+            # .backward() 会作用于loss张量中的所有元素，如果loss是向量，
+            # 相当于对每个loss分量都调用一次backward，所以必须先聚合。
             scaler.scale(loss).backward()
         
         # 梯度裁剪
