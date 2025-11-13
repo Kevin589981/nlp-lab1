@@ -24,7 +24,7 @@ df = pd.read_csv(input_csv)
 # 随机打乱数据
 df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
-df = df[:100]  # 仅使用前100条数据进行快速测试
+# df = df[:100]  # 仅使用前100条数据进行快速测试
 
 total_samples = len(df)
 print(f"总样本数: {total_samples}")
@@ -94,8 +94,8 @@ class Config:
     resume_from = None  # checkpoint路径，当init_from='resume'时使用
     
     # 批次配置
-    batch_size = 2
-    gradient_accumulation_steps = 64
+    batch_size = 16
+    gradient_accumulation_steps = 8
     max_source_length = 512  # 输入对话的最大长度
     max_target_length = 128  # 目标摘要的最大长度
     
@@ -448,7 +448,7 @@ def train():
         optimizer.load_state_dict(checkpoint['optimizer'])
     
     # 初始化GradScaler
-    scaler = torch.cuda.amp.GradScaler(enabled=(config.dtype == 'float16'))
+    scaler = torch.amp.GradScaler('cuda',enabled=(config.dtype == 'float16'))
     
     # 编译模型（可选）
     if config.compile:
