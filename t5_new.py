@@ -90,11 +90,11 @@ class Config:
     gradient_accumulation_steps = 4  # 梯度累积步数
     max_iters = 50            # 总训练迭代次数
     
-    # 优化器配置
-    learning_rate = 3e-4      # 学习率
-    weight_decay = 1e-2       # 权重衰减
-    grad_clip = 1.0           # 梯度裁剪
-    warmup_steps = 100        # 预热步数
+    # 优化器配置（修改：降低学习率）
+    learning_rate = 5e-5      # 降低学习率
+    weight_decay = 0.01       # 减小权重衰减
+    grad_clip = 0.5           # 更严格的梯度裁剪
+    warmup_steps = 50         # 减少预热步数
     
     # I/O配置
     out_dir = 'out-t5-summarization'  # checkpoint保存目录
@@ -227,7 +227,16 @@ def estimate_loss(model, tokenizer, device):
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             
-            with autocast(dtype=torch.float16):
+            # 修复autocast语法
+            if torch.cuda.is_available():
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss
+            else:
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -235,16 +244,19 @@ def estimate_loss(model, tokenizer, device):
                 )
                 loss = outputs.loss
                 
-                # 如果是DataParallel，loss可能是多个GPU的结果，需要取平均
-                if is_parallel and loss.dim() > 0:
-                    loss = loss.mean()
-                
-            losses.append(loss.item())
+            # 如果是DataParallel，loss可能是多个GPU的结果，需要取平均
+            if is_parallel and loss.dim() > 0:
+                loss = loss.mean()
+            
+            # 检查NaN
+            if not torch.isnan(loss) and not torch.isinf(loss):
+                losses.append(loss.item())
         
-        out[split] = np.mean(losses) if losses else 0.0
+        out[split] = np.mean(losses) if losses else float('inf')
     
     model.train()
     return out
+
 
 @torch.no_grad()
 def evaluate_rouge_during_training(model, tokenizer, device, num_samples=3):
@@ -278,25 +290,27 @@ def evaluate_rouge_during_training(model, tokenizer, device, num_samples=3):
             return_tensors='pt'
         ).input_ids.to(device)
         
-        # 生成摘要
-        with autocast(dtype=torch.float16):
+        try:
+            # 生成摘要（使用更保守的参数）
             generated_ids = model.generate(
                 input_ids,
                 max_length=config.max_target_length,
                 num_beams=2,
-                temperature=0.8,
-                do_sample=True,
-                top_p=0.9,
+                temperature=1.0,
+                do_sample=False,  # 关闭采样，使用贪婪解码
                 early_stopping=True
             )
-        
-        generated_summary = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        
-        # 计算ROUGE分数
-        scores = scorer.score(reference_summary, generated_summary)
-        rouge1_scores.append(scores['rouge1'].fmeasure)
-        rouge2_scores.append(scores['rouge2'].fmeasure)
-        rougeL_scores.append(scores['rougeL'].fmeasure)
+            
+            generated_summary = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+            
+            # 计算ROUGE分数
+            scores = scorer.score(reference_summary, generated_summary)
+            rouge1_scores.append(scores['rouge1'].fmeasure)
+            rouge2_scores.append(scores['rouge2'].fmeasure)
+            rougeL_scores.append(scores['rougeL'].fmeasure)
+        except Exception as e:
+            print(f"  生成时出错: {e}")
+            continue
     
     model.train()
     
@@ -338,9 +352,7 @@ def train():
             print(f"从checkpoint恢复: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             model = T5ForConditionalGeneration.from_pretrained(config.model_name)
-            # 处理可能的DataParallel wrapper
             state_dict = checkpoint['model_state_dict']
-            # 移除DataParallel的module前缀
             new_state_dict = {}
             for k, v in state_dict.items():
                 if k.startswith('module.'):
@@ -423,6 +435,7 @@ def train():
     train_iter = iter(train_dataloader)
     iter_num = start_iter
     accumulated_loss = 0.0
+    skip_update = False
     
     while iter_num < config.max_iters:
         t0 = time.time()
@@ -439,30 +452,57 @@ def train():
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             
-            with autocast(dtype=torch.float16):
+            # 修复autocast语法
+            if torch.cuda.is_available():
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss
+                    
+                    if isinstance(model, nn.DataParallel):
+                        if loss.dim() > 0:
+                            loss = loss.mean()
+                    
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"  警告: 检测到NaN/Inf loss，跳过此批次")
+                        skip_update = True
+                        break
+                        
+                    loss = loss / config.gradient_accumulation_steps
+            else:
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     labels=labels
                 )
-                loss = outputs.loss
-                
-                # 如果使用DataParallel，确保loss是标量
-                if isinstance(model, nn.DataParallel):
-                    if loss.dim() > 0:
-                        loss = loss.mean()
-                    
-                loss = loss / config.gradient_accumulation_steps
+                loss = outputs.loss / config.gradient_accumulation_steps
             
             scaler.scale(loss).backward()
             accumulated_loss += loss.item()
         
+        # 如果检测到NaN，跳过这次更新
+        if skip_update:
+            optimizer.zero_grad()
+            skip_update = False
+            accumulated_loss = 0.0
+            continue
+        
         # 梯度裁剪
         scaler.unscale_(optimizer)
-        if isinstance(model, nn.DataParallel):
-            torch.nn.utils.clip_grad_norm_(model.module.parameters(), config.grad_clip)
-        else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.module.parameters() if isinstance(model, nn.DataParallel) else model.parameters(),
+            config.grad_clip
+        )
+        
+        # 如果梯度有NaN，跳过更新
+        if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+            print(f"  警告: 检测到NaN/Inf梯度，跳过更新")
+            optimizer.zero_grad()
+            accumulated_loss = 0.0
+            continue
         
         # 优化器步骤
         scaler.step(optimizer)
@@ -475,51 +515,54 @@ def train():
             t1 = time.time()
             dt = t1 - t0
             lossf = accumulated_loss * config.gradient_accumulation_steps
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {scheduler.get_last_lr()[0]:.2e}")
+            if not np.isnan(lossf):
+                print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {scheduler.get_last_lr()[0]:.2e}")
+            else:
+                print(f"iter {iter_num}: loss NaN detected, time {dt*1000:.2f}ms")
         
         # 评估
         if iter_num % config.eval_interval == 0 and iter_num > 0:
             losses = estimate_loss(model, tokenizer, device)
-            print(f"\nStep {iter_num}: train loss {losses['train']:.4f}, val loss {losses['validation']:.4f}")
-            
-            # ROUGE评估
-            if config.eval_rouge_during_training:
-                print("  评估ROUGE分数...")
-                # 获取实际模型（如果使用DataParallel）
-                eval_model = model.module if isinstance(model, nn.DataParallel) else model
-                rouge_scores = evaluate_rouge_during_training(
-                    eval_model, tokenizer, device, 
-                    num_samples=config.rouge_eval_samples
-                )
-                if rouge_scores:
-                    print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}, "
-                          f"ROUGE-2: {rouge_scores['rouge2']:.4f}, "
-                          f"ROUGE-L: {rouge_scores['rougeL']:.4f}")
-            
-            # 保存checkpoint
-            if losses['validation'] < best_val_loss or config.always_save_checkpoint:
-                best_val_loss = losses['validation']
+            if not np.isnan(losses['train']) and not np.isnan(losses['validation']):
+                print(f"\nStep {iter_num}: train loss {losses['train']:.4f}, val loss {losses['validation']:.4f}")
                 
-                # 获取实际模型（如果使用DataParallel）
-                model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+                # ROUGE评估
+                if config.eval_rouge_during_training:
+                    print("  评估ROUGE分数...")
+                    eval_model = model.module if isinstance(model, nn.DataParallel) else model
+                    rouge_scores = evaluate_rouge_during_training(
+                        eval_model, tokenizer, device, 
+                        num_samples=config.rouge_eval_samples
+                    )
+                    if rouge_scores:
+                        print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}, "
+                              f"ROUGE-2: {rouge_scores['rouge2']:.4f}, "
+                              f"ROUGE-L: {rouge_scores['rougeL']:.4f}")
                 
-                checkpoint = {
-                    'model_state_dict': model_to_save.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict(),
-                    'iter_num': iter_num,
-                    'best_val_loss': best_val_loss,
-                    'config': vars(config)
-                }
-                
-                checkpoint_path = os.path.join(config.out_dir, 'checkpoint.pt')
-                torch.save(checkpoint, checkpoint_path)
-                print(f"  保存checkpoint到 {checkpoint_path}")
-                
-                # 同时保存模型（方便直接加载）
-                model_to_save.save_pretrained(os.path.join(config.out_dir, 'model'))
-                tokenizer.save_pretrained(os.path.join(config.out_dir, 'model'))
+                # 保存checkpoint
+                if losses['validation'] < best_val_loss or config.always_save_checkpoint:
+                    best_val_loss = losses['validation']
+                    
+                    model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+                    
+                    checkpoint = {
+                        'model_state_dict': model_to_save.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'scaler_state_dict': scaler.state_dict(),
+                        'iter_num': iter_num,
+                        'best_val_loss': best_val_loss,
+                        'config': vars(config)
+                    }
+                    
+                    checkpoint_path = os.path.join(config.out_dir, 'checkpoint.pt')
+                    torch.save(checkpoint, checkpoint_path)
+                    print(f"  保存checkpoint到 {checkpoint_path}")
+                    
+                    model_to_save.save_pretrained(os.path.join(config.out_dir, 'model'))
+                    tokenizer.save_pretrained(os.path.join(config.out_dir, 'model'))
+            else:
+                print(f"\nStep {iter_num}: 检测到NaN loss，跳过评估")
         
         accumulated_loss = 0.0
         iter_num += 1
@@ -599,7 +642,7 @@ def evaluate():
         
         # 生成摘要
         with torch.no_grad():
-            with autocast(dtype=torch.float16):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=torch.cuda.is_available()):
                 generated_ids = model.generate(
                     input_ids,
                     max_length=config.max_target_length,
@@ -696,7 +739,7 @@ def predict_test_set():
         
         # 生成摘要
         with torch.no_grad():
-            with autocast(dtype=torch.float16):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=torch.cuda.is_available()):
                 generated_ids = model.generate(
                     input_ids,
                     max_length=config.max_target_length,
