@@ -505,7 +505,13 @@ def train_model():
                     attention_mask=attention_mask,
                     labels=labels
                 )
-                loss = outputs.loss / config.gradient_accumulation_steps
+                loss = outputs.loss
+
+                # 关键修复：如果是多GPU，loss是一个向量，需要求平均值将其变为标量
+                if loss.dim() > 0:
+                    loss = loss.mean()
+
+                loss = loss / config.gradient_accumulation_steps
             
             # 反向传播
             scaler.scale(loss).backward()
