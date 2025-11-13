@@ -11,10 +11,11 @@
 # !pip install rouge-score transformers accelerate
 
 # %%
-os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
+
 import pandas as pd
 import os
 import numpy as np
+os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 print("\n" + "=" * 80)
 print("准备SAMSum数据集划分")
 print("=" * 80)
