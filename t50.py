@@ -11,6 +11,7 @@
 # !pip install rouge-score transformers accelerate
 
 # %%
+os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
 import pandas as pd
 import os
 import numpy as np
@@ -114,7 +115,7 @@ class Config:
     warmup_steps: int = 100                  # 学习率预热步数
     
     # 优化配置
-    dtype: str = 'float16'                   # 只使用float16
+    dtype: str = 'float32'                   # 只使用float32
     gradient_checkpointing: bool = True      # 开启梯度检查点
     
     # 评估配置
@@ -281,7 +282,7 @@ def evaluate_model(model, dataloader, tokenizer, device, max_eval_samples=None):
         labels = batch['labels'].to(device)
         
         # 计算loss
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.cuda.amp.autocast(dtype=torch.float32):
             outputs = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -292,7 +293,7 @@ def evaluate_model(model, dataloader, tokenizer, device, max_eval_samples=None):
             num_batches += 1
         
         # 生成预测
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.cuda.amp.autocast(dtype=torch.float32):
             predictions = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -376,7 +377,7 @@ def train_model():
     tokenizer = T5Tokenizer.from_pretrained(config.model_name, legacy=False)
     model = T5ForConditionalGeneration.from_pretrained(
         config.model_name,
-        # torch_dtype=torch.float16 if config.dtype == 'float16' else torch.float32
+        # torch_dtype=torch.float32 if config.dtype == 'float32' else torch.float32
     )
     
     # 开启梯度检查点
@@ -428,8 +429,8 @@ def train_model():
     )
     
     # 混合精度scaler
-    scaler = torch.cuda.amp.GradScaler()
-    
+    # scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
     # 恢复训练
     start_epoch = 0
     global_step = 0
@@ -500,7 +501,7 @@ def train_model():
             labels = batch['labels'].to(device, non_blocking=True)
             
             # 前向传播
-            with torch.cuda.amp.autocast(dtype=torch.float16):
+            with torch.cuda.amp.autocast(dtype=torch.float32):
                 outputs = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -636,7 +637,7 @@ def predict_test_set():
     tokenizer = T5Tokenizer.from_pretrained(model_path)
     model = T5ForConditionalGeneration.from_pretrained(
         model_path,
-        torch_dtype=torch.float16 if config.dtype == 'float16' else torch.float32
+        torch_dtype=torch.float32 if config.dtype == 'float32' else torch.float32
     )
     model = model.to(device)
     model.eval()
@@ -681,7 +682,7 @@ def predict_test_set():
         
         # 生成摘要
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=torch.float16):
+            with torch.cuda.amp.autocast(dtype=torch.float32):
                 outputs = model.generate(
                     **inputs,
                     max_length=config.max_target_length,
