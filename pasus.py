@@ -40,6 +40,8 @@ df = pd.read_csv(input_csv)
 # 随机打乱数据
 df = df.sample(frac=1, random_state=42).reset_index(drop=True)
 
+df = df[:100]
+
 # 计算划分点（5%作为验证集）
 total_samples = len(df)
 val_size = int(total_samples * 0.05)
