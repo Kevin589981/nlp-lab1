@@ -72,7 +72,7 @@ import csv
 from contextlib import nullcontext
 from dataclasses import dataclass
 import argparse
-
+# %%
 import numpy as np
 import torch
 import torch.nn as nn
@@ -83,6 +83,7 @@ from transformers import (
     T5Tokenizer,
     get_linear_schedule_with_warmup
 )
+# %%
 from torch.optim import AdamW
 from tqdm import tqdm
 import torch.distributed as dist
@@ -135,7 +136,7 @@ class Config:
     world_size: int = 2                      # 总GPU数量
 
 config = Config()
-
+# %%
 # =============================================================================
 # 多GPU初始化
 # =============================================================================
@@ -157,7 +158,7 @@ def init_distributed():
 
 # 初始化分布式
 use_ddp = init_distributed()
-
+# %%
 # =============================================================================
 # 数据集类
 # =============================================================================
@@ -220,7 +221,7 @@ class SummarizationDataset(Dataset):
             'attention_mask': input_encoding['attention_mask'].flatten(),
             'labels': labels.flatten()
         }
-
+# %%
 # =============================================================================
 # 数据加载器
 # =============================================================================
@@ -252,7 +253,7 @@ def get_dataloader(csv_path, tokenizer, batch_size, shuffle=True):
     )
     
     return dataloader, dataset
-
+# %%
 # =============================================================================
 # 评估函数
 # =============================================================================
@@ -355,7 +356,7 @@ def calculate_rouge_scores(references, predictions):
     except ImportError:
         print("警告: rouge-score未安装，跳过ROUGE评估")
         return None
-
+# %%
 # =============================================================================
 # 训练函数
 # =============================================================================
@@ -375,7 +376,7 @@ def train_model():
     tokenizer = T5Tokenizer.from_pretrained(config.model_name, legacy=False)
     model = T5ForConditionalGeneration.from_pretrained(
         config.model_name,
-        torch_dtype=torch.float16 if config.dtype == 'float16' else torch.float32
+        # torch_dtype=torch.float16 if config.dtype == 'float16' else torch.float32
     )
     
     # 开启梯度检查点
@@ -586,7 +587,7 @@ def train_model():
     
     print("训练完成！")
     print(f"最佳ROUGE-L分数: {best_rouge:.4f}")
-
+# %%
 def save_checkpoint(model, optimizer, scheduler, tokenizer, epoch, global_step, best_rouge, save_path):
     """保存检查点"""
     os.makedirs(save_path, exist_ok=True)
@@ -613,7 +614,7 @@ def save_checkpoint(model, optimizer, scheduler, tokenizer, epoch, global_step, 
     }
     
     torch.save(checkpoint, os.path.join(save_path, 'training_state.pt'))
-
+# %%
 # =============================================================================
 # 推理函数
 # =============================================================================
@@ -710,7 +711,7 @@ def predict_test_set():
     
     print(f"推理完成！结果保存至: {output_file}")
     return output_file
-
+# %%
 # =============================================================================
 # 主函数
 # =============================================================================
@@ -741,7 +742,7 @@ if __name__ == "__main__":
 
 # %%
 # 直接运行训练
-main()
+
 
 # %%
 # 如果需要评估已训练的模型，设置eval_only=True
