@@ -5,7 +5,7 @@
 # 保存到/kaggle/working/data/samsum目录
 
 # %%
-!pip install rouge-score
+!pip install rouge-score transformers accelerate sentencepiece -q
 
 # %%
 import pandas as pd
@@ -212,6 +212,9 @@ def estimate_loss(model, tokenizer, device):
     out = {}
     model.eval()
     
+    # 判断是否使用了DataParallel
+    is_parallel = isinstance(model, nn.DataParallel)
+    
     for split in ['train', 'validation']:
         dataloader = get_dataloader(split, tokenizer)
         losses = []
@@ -231,6 +234,10 @@ def estimate_loss(model, tokenizer, device):
                     labels=labels
                 )
                 loss = outputs.loss
+                
+                # 如果是DataParallel，loss可能是多个GPU的结果，需要取平均
+                if is_parallel and loss.dim() > 0:
+                    loss = loss.mean()
                 
             losses.append(loss.item())
         
@@ -323,14 +330,24 @@ def train():
     print(f"\n加载模型: {config.model_name}")
     tokenizer = T5Tokenizer.from_pretrained(config.model_name)
     
+    # 初始化或恢复模型
+    checkpoint = None
     if config.resume and not config.eval_only:
-        # 从checkpoint恢复
         checkpoint_path = os.path.join(config.out_dir, 'checkpoint.pt')
         if os.path.exists(checkpoint_path):
             print(f"从checkpoint恢复: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             model = T5ForConditionalGeneration.from_pretrained(config.model_name)
-            model.load_state_dict(checkpoint['model_state_dict'])
+            # 处理可能的DataParallel wrapper
+            state_dict = checkpoint['model_state_dict']
+            # 移除DataParallel的module前缀
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            model.load_state_dict(new_state_dict)
             start_iter = checkpoint['iter_num']
             best_val_loss = checkpoint.get('best_val_loss', float('inf'))
         else:
@@ -347,15 +364,16 @@ def train():
     if config.n_gpu > 1:
         print(f"使用 {config.n_gpu} 个GPU进行训练")
         device = torch.device("cuda:0")
-        model = nn.DataParallel(model)
         model = model.to(device)
+        model = nn.DataParallel(model)
     else:
         device = torch.device(config.device)
         model = model.to(device)
     
     # 打印模型参数数量
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_for_params = model.module if isinstance(model, nn.DataParallel) else model
+    total_params = sum(p.numel() for p in model_for_params.parameters())
+    trainable_params = sum(p.numel() for p in model_for_params.parameters() if p.requires_grad)
     print(f"总参数数: {total_params/1e6:.2f}M")
     print(f"可训练参数数: {trainable_params/1e6:.2f}M")
     
@@ -386,10 +404,12 @@ def train():
     scaler = GradScaler()
     
     # 如果恢复训练，加载优化器和调度器状态
-    if config.resume and 'optimizer_state_dict' in checkpoint:
+    if config.resume and checkpoint and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scaler_state_dict' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
     
     # 训练循环
     print("\n开始训练循环...")
@@ -427,9 +447,10 @@ def train():
                 )
                 loss = outputs.loss
                 
-                # 如果使用DataParallel，loss会自动平均
-                if config.n_gpu > 1:
-                    loss = loss.mean()
+                # 如果使用DataParallel，确保loss是标量
+                if isinstance(model, nn.DataParallel):
+                    if loss.dim() > 0:
+                        loss = loss.mean()
                     
                 loss = loss / config.gradient_accumulation_steps
             
@@ -438,7 +459,7 @@ def train():
         
         # 梯度裁剪
         scaler.unscale_(optimizer)
-        if config.n_gpu > 1:
+        if isinstance(model, nn.DataParallel):
             torch.nn.utils.clip_grad_norm_(model.module.parameters(), config.grad_clip)
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
@@ -465,7 +486,7 @@ def train():
             if config.eval_rouge_during_training:
                 print("  评估ROUGE分数...")
                 # 获取实际模型（如果使用DataParallel）
-                eval_model = model.module if config.n_gpu > 1 else model
+                eval_model = model.module if isinstance(model, nn.DataParallel) else model
                 rouge_scores = evaluate_rouge_during_training(
                     eval_model, tokenizer, device, 
                     num_samples=config.rouge_eval_samples
@@ -480,7 +501,7 @@ def train():
                 best_val_loss = losses['validation']
                 
                 # 获取实际模型（如果使用DataParallel）
-                model_to_save = model.module if config.n_gpu > 1 else model
+                model_to_save = model.module if isinstance(model, nn.DataParallel) else model
                 
                 checkpoint = {
                     'model_state_dict': model_to_save.state_dict(),
@@ -531,7 +552,15 @@ def evaluate():
             tokenizer = T5Tokenizer.from_pretrained(config.model_name)
             model = T5ForConditionalGeneration.from_pretrained(config.model_name)
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            model.load_state_dict(checkpoint['model_state_dict'])
+            # 处理可能的DataParallel wrapper
+            state_dict = checkpoint['model_state_dict']
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            model.load_state_dict(new_state_dict)
         else:
             print("错误: 未找到训练好的模型")
             return
@@ -624,7 +653,15 @@ def predict_test_set():
             tokenizer = T5Tokenizer.from_pretrained(config.model_name)
             model = T5ForConditionalGeneration.from_pretrained(config.model_name)
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            model.load_state_dict(checkpoint['model_state_dict'])
+            # 处理可能的DataParallel wrapper
+            state_dict = checkpoint['model_state_dict']
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            model.load_state_dict(new_state_dict)
         else:
             print("错误: 未找到训练好的模型")
             return
