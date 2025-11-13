@@ -5,7 +5,7 @@
 # 保存到/kaggle/working/data/samsum目录
 
 # %%
-!pip install rouge-score transformers accelerate sentencepiece -q
+# !pip install rouge-score transformers accelerate sentencepiece -q
 
 # %%
 import pandas as pd
