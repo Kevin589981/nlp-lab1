@@ -372,7 +372,7 @@ def train_model():
     
     # 加载tokenizer和模型
     print(f"加载模型: {config.model_name}")
-    tokenizer = T5Tokenizer.from_pretrained(config.model_name)
+    tokenizer = T5Tokenizer.from_pretrained(config.model_name, legacy=False)
     model = T5ForConditionalGeneration.from_pretrained(
         config.model_name,
         torch_dtype=torch.float16 if config.dtype == 'float16' else torch.float32
