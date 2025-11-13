@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 @dataclass
 class TrainingConfig:
     # --- 模型和数据路径配置 ---
-    model_checkpoint: str = "google/pegasus-base"
+    model_checkpoint: str = "google/pegasus-x-base"
     train_file_path: str = "/kaggle/working/data/samsum/train.csv"
     validation_file_path: str = "/kaggle/working/data/samsum/validation.csv"
     test_file_path: str = "/kaggle/input/nanogpt-fudan-cs-30040/test.csv"
