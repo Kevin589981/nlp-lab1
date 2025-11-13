@@ -23,11 +23,14 @@ input_csv = '/kaggle/input/nanogpt-fudannlp-cs-30040/train.csv'
 print(f"\n读取数据: {input_csv}")
 
 df = pd.read_csv(input_csv)
-total_samples = len(df)
-print(f"总样本数: {total_samples}")
 
 # 随机打乱数据
 df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+df = df[:100]
+
+total_samples = len(df)
+print(f"总样本数: {total_samples}")
+
 
 # 计算划分点（5%作为验证集）
 val_size = int(total_samples * 0.05)
@@ -78,9 +81,9 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import (
     T5ForConditionalGeneration, 
     T5Tokenizer,
-    AdamW,
     get_linear_schedule_with_warmup
 )
+from torch.optim import AdamW
 from tqdm import tqdm
 import torch.distributed as dist
 
