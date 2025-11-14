@@ -87,7 +87,7 @@ class Config:
     dataset = 'samsum'
     
     # 模型配置
-    model_name = 'facebook/bart-base'
+    model_name = 'sshleifer/distilbart-cnn-12-6'
     label_smoothing_factor = 0.1
 
     # 训练配置
@@ -98,7 +98,7 @@ class Config:
     use_multi_gpu = True  # 是否使用多GPU
     
     # 批次配置 - 针对2个T4 GPU优化
-    batch_size = 64  # 每个GPU的batch size
+    batch_size = 32  # 每个GPU的batch size
     gradient_accumulation_steps = 8  # 减少梯度累积，因为有2个GPU
     max_source_length = 512  # 输入对话的最大长度
     max_target_length = 128  # 目标摘要的最大长度
@@ -107,8 +107,8 @@ class Config:
     max_iters = 10
     
     # 优化器配置
-    learning_rate = 3e-5
-    weight_decay = 0.01
+    learning_rate = 6e-5
+    weight_decay = 0.001
     beta1 = 0.9
     beta2 = 0.999
     grad_clip = 1.0
@@ -117,9 +117,16 @@ class Config:
     decay_lr = True
     # warmup_iters = 100
     warmup_iters = int(0.1 *max_iters)
-    lr_decay_iters = 500
-    min_lr = 1e-6
+    lr_decay_iters = int(0.9*max_iters)
+    min_lr = 6e-6
     
+    # 早停配置  <--- 在这里添加新配置
+    use_early_stopping = True       # 是否启用早停
+    early_stopping_patience = 5     # 验证集损失连续多少个评估周期没有改善就停止
+
+    length_penalty = 1.5          # 大于1.0鼓励长摘要，小于1.0鼓励短摘要
+    no_repeat_ngram_size = 3      # 防止重复3-grams的出现
+
     # I/O配置
     out_dir = 'out-bart-summarization'
     eval_interval = 10
@@ -381,7 +388,9 @@ def evaluate_rouge_during_training(model, tokenizer, ctx, num_samples=5):
                 attention_mask=inputs['attention_mask'],
                 max_length=config.max_target_length,
                 num_beams=config.num_beams,
-                early_stopping=True
+                early_stopping=True,
+                length_penalty=config.length_penalty,
+                no_repeat_ngram_size=config.no_repeat_ngram_size
             )
         
         generated_summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -412,67 +421,59 @@ def train():
     print("\n" + "=" * 80)
     print("开始训练...")
     print("=" * 80)
-    
+
     # 设置随机种子
     torch.manual_seed(1337)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    
+
     # 创建输出目录
     os.makedirs(config.out_dir, exist_ok=True)
-    
+
     # 设置设备和精度
     device_type = 'cuda' if 'cuda' in config.device else 'cpu'
-    ptdtype = {
-        'float32': torch.float32,
-        'bfloat16': torch.bfloat16,
-        'float16': torch.float16
-    }[config.dtype]
-    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(
-        device_type=device_type, dtype=ptdtype
-    )
-    
-    # 初始化tokenizer
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[config.dtype]
+    ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+
+    # 初始化tokenizer (使用AutoTokenizer以支持不同模型)
     print(f"\n加载tokenizer: {config.model_name}")
-    tokenizer = BartTokenizer.from_pretrained(config.model_name)
-    
+    # 注意：为了支持T5等模型，最好使用AutoTokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+
     # 初始化模型
     print(f"\n模型初始化方式: {config.init_from}")
-    
-    if config.init_from == 'scratch':
-        print("从头开始训练新模型")
-        model_config = BartConfig.from_pretrained(config.model_name)
-        model = BartForConditionalGeneration(model_config)
-        iter_num = 0
-        best_val_loss = 1e9
-        
-    elif config.init_from == 'resume':
-        print(f"从checkpoint恢复训练")
-        if config.resume_from is None:
-            ckpt_path = os.path.join(config.out_dir, 'ckpt.pt')
-        else:
-            ckpt_path = config.resume_from
-        
-        checkpoint = torch.load(ckpt_path, map_location=config.device)
-        print("  加载模型配置...")
-        model_config = BartConfig.from_pretrained(config.model_name)
-    
-        # 2. 修改配置，设置标签平滑因子
+    iter_num = 0
+    best_val_loss = 1e9
+
+    # --- 统一的模型加载逻辑 ---
+    # 1. 加载模型配置
+    print("  加载模型配置...")
+    model_config = BartConfig.from_pretrained(config.model_name)
+
+    # 2. 修改配置，设置标签平滑因子
+    if hasattr(config, 'label_smoothing_factor'):
         model_config.label_smoothing_factor = config.label_smoothing_factor
         print(f"  启用标签平滑, factor: {model_config.label_smoothing_factor}")
-    
-        # 3. 使用修改后的配置加载模型
+
+    # 3. 根据配置初始化或加载模型
+    if config.init_from == 'scratch':
+        print("从头开始训练新模型")
+        model = BartForConditionalGeneration(model_config)
+    else: # resume or pretrained
+        print(f"从预训练模型或checkpoint加载: {config.model_name}")
         model = BartForConditionalGeneration.from_pretrained(
             config.model_name,
-            config=model_config  # <--- 将修改后的配置传入
+            config=model_config
         )
-    
 
-        print(f"  启用标签平滑, factor: {config.label_smoothing_factor}") 
-        
-        # 处理DataParallel保存的模型
+    # 如果是'resume'，则额外加载checkpoint的状态
+    if config.init_from == 'resume':
+        print(f"从checkpoint恢复训练状态")
+        ckpt_path = os.path.join(config.out_dir, 'ckpt.pt') if config.resume_from is None else config.resume_from
+        checkpoint = torch.load(ckpt_path, map_location=config.device)
+
         state_dict = checkpoint['model']
-        # 移除'module.'前缀（如果存在）
         from collections import OrderedDict
         new_state_dict = OrderedDict()
         for k, v in state_dict.items():
@@ -482,40 +483,18 @@ def train():
         model.load_state_dict(new_state_dict)
         iter_num = checkpoint['iter_num']
         best_val_loss = checkpoint['best_val_loss']
-        
-    else:  # pretrained
-        print(f"从预训练模型加载: {config.model_name}")
-        # model = BartForConditionalGeneration.from_pretrained(config.model_name)
-        # iter_num = 0
-        # best_val_loss = 1e9
-
-        print("  加载模型配置...")
-        model_config = BartConfig.from_pretrained(config.model_name)
-        
-        # 2. 修改配置，设置标签平滑因子
-        model_config.label_smoothing_factor = config.label_smoothing_factor
-        print(f"  启用标签平滑, factor: {model_config.label_smoothing_factor}")
-        
-        # 3. 使用修改后的配置加载模型
-        model = BartForConditionalGeneration.from_pretrained(
-            config.model_name,
-            config=model_config  # <--- 将修改后的配置传入
-        )
-        
-        iter_num = 0
-        best_val_loss = 1e9
+        print(f"  成功恢复，起始迭代: {iter_num}, 最佳验证损失: {best_val_loss:.4f}")
     
     model.to(config.device)
-    
+
     # 使用DataParallel包装模型（如果有多个GPU）
     if torch.cuda.device_count() > 1 and config.use_multi_gpu:
         print(f"\n使用DataParallel在 {torch.cuda.device_count()} 个GPU上训练")
         model = nn.DataParallel(model)
-        # 保存原始模型引用（用于保存checkpoint）
         raw_model = model.module
     else:
         raw_model = model
-    
+
     # 初始化优化器
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -523,22 +502,23 @@ def train():
         betas=(config.beta1, config.beta2),
         weight_decay=config.weight_decay
     )
-    
     if config.init_from == 'resume' and 'optimizer' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer'])
-    
+
     # 初始化GradScaler
     scaler = torch.amp.GradScaler('cuda', enabled=(config.dtype == 'float16'))
     
     # 编译模型（可选）
     if config.compile:
         print("编译模型...")
-        # 注意：DataParallel与torch.compile可能不兼容
         if not isinstance(model, nn.DataParallel):
             model = torch.compile(model)
         else:
             print("警告: DataParallel模式下跳过编译")
-    
+
+    # 初始化早停计数器
+    patience_counter = 0
+
     # 训练循环
     print("\n开始训练循环...")
     print(f"总迭代次数: {config.max_iters}")
@@ -549,39 +529,38 @@ def train():
     if torch.cuda.device_count() > 1 and config.use_multi_gpu:
         effective_batch_size *= torch.cuda.device_count()
     print(f"有效批次大小: {effective_batch_size}")
+    if config.use_early_stopping:
+        print(f"早停已启用, 耐心值: {config.early_stopping_patience}")
     print("-" * 80)
-    
+
     t0 = time.time()
-    local_iter_num = 0
     
     while True:
         # 设置学习率
         lr = get_lr(iter_num) if config.decay_lr else config.learning_rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-        
-        # 评估和保存checkpoint
+
+        # 评估、保存checkpoint和执行早停
         if iter_num % config.eval_interval == 0:
             losses = estimate_loss(model, ctx, tokenizer)
             print(f"\nStep {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-            
+
             # 计算ROUGE分数
             if iter_num > 0 and config.eval_rouge_during_training:
                 print("  评估ROUGE分数...")
-                rouge_scores = evaluate_rouge_during_training(
-                    model, tokenizer, ctx, num_samples=config.rouge_eval_samples
-                )
+                rouge_scores = evaluate_rouge_during_training(model, tokenizer, ctx, num_samples=config.rouge_eval_samples)
                 if rouge_scores:
-                    print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}, "
-                          f"ROUGE-2: {rouge_scores['rouge2']:.4f}, "
-                          f"ROUGE-L: {rouge_scores['rougeL']:.4f}")
-            
-            # 保存checkpoint
-            if losses['val'] < best_val_loss or config.always_save_checkpoint:
+                    print(f"  ROUGE-1: {rouge_scores['rouge1']:.4f}, ROUGE-2: {rouge_scores['rouge2']:.4f}, ROUGE-L: {rouge_scores['rougeL']:.4f}")
+
+            # 早停与Checkpoint保存逻辑
+            if losses['val'] < best_val_loss:
                 best_val_loss = losses['val']
+                patience_counter = 0
+                print(f"  新的最佳验证损失: {best_val_loss:.4f}。重置耐心计数。")
                 if iter_num > 0:
                     checkpoint = {
-                        'model': raw_model.state_dict(),  # 保存原始模型（不含DataParallel包装）
+                        'model': raw_model.state_dict(),
                         'optimizer': optimizer.state_dict(),
                         'iter_num': iter_num,
                         'best_val_loss': best_val_loss,
@@ -589,55 +568,55 @@ def train():
                     }
                     print(f"  保存checkpoint到 {config.out_dir}")
                     torch.save(checkpoint, os.path.join(config.out_dir, 'ckpt.pt'))
-        
+            else:
+                patience_counter += 1
+                print(f"  验证损失未改善。耐心计数: {patience_counter}/{config.early_stopping_patience}")
+
+            # 检查是否触发早停
+            if config.use_early_stopping and patience_counter >= config.early_stopping_patience:
+                print("\n" + "="*80)
+                print(f"早停已触发，连续 {patience_counter} 次评估性能未提升。")
+                print(f"最佳验证损失为 {best_val_loss:.4f}。")
+                print("="*80)
+                break  # 跳出训练循环
+
         if iter_num == 0 and config.eval_only:
             break
-        
+
         # 训练步骤
         model.train()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True) # 使用set_to_none=True以获得轻微的性能提升
         
         for micro_step in range(config.gradient_accumulation_steps):
             batch = get_batch('train', tokenizer)
-            
             with ctx:
                 outputs = model(**batch)
                 loss = outputs.loss
-                # 当使用DataParallel时，loss是一个包含每个GPU loss的向量
-                # 我们需要先求平均值，得到整个批次的平均loss
                 if torch.cuda.device_count() > 1 and config.use_multi_gpu:
                     loss = loss.mean()
-                
                 loss = loss / config.gradient_accumulation_steps
-            
-            # .backward() 会作用于loss张量中的所有元素，如果loss是向量，
-            # 相当于对每个loss分量都调用一次backward，所以必须先聚合。
             scaler.scale(loss).backward()
-        
-        # 梯度裁剪
+
         if config.grad_clip != 0.0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
-        
-        # 更新参数
+
         scaler.step(optimizer)
         scaler.update()
-        
+
         # 记录日志
         t1 = time.time()
         dt = t1 - t0
         t0 = t1
-        
         if iter_num % config.log_interval == 0:
             lossf = loss.item() * config.gradient_accumulation_steps
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.2e}")
-        
+
         iter_num += 1
-        local_iter_num += 1
-        
+
         if iter_num > config.max_iters:
             break
-    
+
     print("\n训练完成！")
     print("=" * 80)
 
@@ -784,7 +763,9 @@ def evaluate():
                     attention_mask=inputs['attention_mask'],
                     max_length=config.max_target_length,
                     num_beams=config.num_beams,
-                    early_stopping=True
+                    early_stopping=True,
+                    length_penalty=config.length_penalty,
+                    no_repeat_ngram_size=config.no_repeat_ngram_size
                 )
         
         generated_summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -876,7 +857,9 @@ def predict_test_set():
                     attention_mask=inputs['attention_mask'],
                     max_length=config.max_target_length,
                     num_beams=config.num_beams,
-                    early_stopping=True
+                    early_stopping=True,
+                    length_penalty=config.length_penalty,
+                    no_repeat_ngram_size=config.no_repeat_ngram_size
                 )
         
         generated_summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
